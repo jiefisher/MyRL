@@ -1,7 +1,7 @@
 export 'PYTORCH_CUDA_ALLOC_CONF=max_split_size_mb:32'
 export 'NCCL_DEBUG=ERROR'
 export 'VLLM_CONFIGURE_LOGGING=0'
-cd /mnt/cpfs2/fangjie/cl/Pai-Megatron-Patch/examples/qwen3
+cd /MyRL/examples/qwen3
 export MP_DATASET_TYPE='raw'
 sh run_mcore_qwen3.sh  \
 dsw  \
@@ -25,9 +25,9 @@ true \
 sel  \
 false \
 10000 \
-/mnt/cpfs2/fangjie/cl/verl/gen_entropy/sample_all.jsonl  \
-/mnt/cpfs2/fangjie/cl/verl/gen_entropy/val.jsonl  \
-/mnt/cpfs2/fangjie/Qwen3-4B-megatron \
+/MyRL/data/sample_all.jsonl  \
+/MyRL/data/val.jsonl  \
+/MyRL/model/Qwen3-4B-megatron \
 10000  \
 10 \
-/mnt/cpfs2/fangjie/test_save
+/MyRL/model/test_save
