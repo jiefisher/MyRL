@@ -30,6 +30,7 @@ from megatron.core import mpu
 from megatron_patch.tokenizer import build_tokenizer, get_tokenizer
 from .json_sft import JSONSFTDataset
 from .json_rlhf import JSONRLHFDataset
+from .json_agent_rlhf import JSONAgentRLHFDataset
 def build_evaluation_dataset(dataset):
     raise NotImplementedError(f"Dataset {dataset} is no longer supported in Pai-Megatron-Patch anymore, downgrade to v0.10.2 or lower to use it.")
 
@@ -112,6 +113,10 @@ def build_dataset(args, train_val_test_num_samples):
         val_dataset = JSONRLHFDataset(args.valid_data_path, args.max_padding_length)
         # test_dataset = JSONRLHFDataset(args.valid_data_path, args.max_padding_length)
         # val_dataset = train_dataset
+        test_dataset = val_dataset
+    elif args.dataset == 'JSON-Agent-RLHF':
+        train_dataset = JSONAgentRLHFDataset(args.train_data_path, args.max_padding_length)
+        val_dataset = JSONAgentRLHFDataset(args.valid_data_path, args.max_padding_length)
         test_dataset = val_dataset
     elif args.dataset == 'MMAP':
         config = core_gpt_dataset_config_from_args(args)

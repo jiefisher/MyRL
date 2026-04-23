@@ -622,4 +622,84 @@ def get_patch_args(parser):
         help="kl penalty",
     )
 
+    group.add_argument(
+        "--ref-load",
+        type=str,
+        default=None,
+        help="Path to reference model checkpoint. If not set, uses --load as reference model path.",
+    )
+
+    # Agent multi-turn
+    group.add_argument(
+        "--agent-multi-turn",
+        action="store_true",
+        default=False,
+        help="Enable multi-turn agent training",
+    )
+    group.add_argument(
+        "--agent-max-turns",
+        type=int,
+        default=5,
+        help="Maximum interaction turns for agent training",
+    )
+    group.add_argument(
+        "--agent-tool-format",
+        type=str,
+        default="qwen3",
+        choices=["qwen3", "react", "function_call"],
+        help="Tool call format for agent training",
+    )
+    group.add_argument(
+        "--agent-max-total-tokens",
+        type=int,
+        default=16384,
+        help="Maximum total tokens across all turns",
+    )
+
+    # Sandbox
+    group.add_argument(
+        "--sandbox-pool-size",
+        type=int,
+        default=8,
+        help="Sandbox process pool size",
+    )
+    group.add_argument(
+        "--sandbox-max-memory-mb",
+        type=int,
+        default=512,
+        help="Max memory per sandbox process in MB",
+    )
+    group.add_argument(
+        "--sandbox-timeout",
+        type=float,
+        default=30.0,
+        help="Sandbox execution timeout in seconds",
+    )
+
+    # Agent reward
+    group.add_argument(
+        "--process-reward-weight",
+        type=float,
+        default=0.2,
+        help="Weight for process rewards in agent training",
+    )
+    group.add_argument(
+        "--final-reward-weight",
+        type=float,
+        default=0.8,
+        help="Weight for final reward in agent training",
+    )
+    group.add_argument(
+        "--tool-success-reward",
+        type=float,
+        default=0.1,
+        help="Reward for successful tool execution",
+    )
+    group.add_argument(
+        "--tool-failure-penalty",
+        type=float,
+        default=-0.1,
+        help="Penalty for failed tool execution",
+    )
+
     return parser

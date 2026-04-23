@@ -258,9 +258,11 @@ class ReinforceRolloutBatch(UserDict):
 
         g_cpu = torch.Generator()
         g_cpu.manual_seed(seed)
-        indices = torch.arange(B)
+        indices = torch.randperm(B, generator=g_cpu)
+        chunks = indices.chunk(split_size)
+        my_indices = chunks[rank]
 
         for k in self.data:
-            chunked_rollout_batch[k] = self.data[k][indices].clone()
+            chunked_rollout_batch[k] = self.data[k][my_indices].clone()
 
         return chunked_rollout_batch

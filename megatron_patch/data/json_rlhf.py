@@ -14,9 +14,13 @@
 
 import numpy as np
 import io
+import os
 import copy
 import json
+import hashlib
 import torch
+import pickle
+from concurrent.futures import ProcessPoolExecutor, as_completed
 try:
     from megatron import get_args
 except:
@@ -26,9 +30,27 @@ from tqdm import tqdm
 
 from megatron_patch.tokenizer import get_tokenizer
 
+
+def _tokenize_chunk(chunk, tokenizer_path, max_seq_length):
+    """Worker function for parallel tokenization."""
+    from transformers import AutoTokenizer
+    tokenizer = AutoTokenizer.from_pretrained(
+        tokenizer_path, use_fast=False, trust_remote_code=True
+    )
+    results = []
+    for item in chunk:
+        prompt = item["prompt"]
+        chats = [{"role": "user", "content": prompt}]
+        source = tokenizer.apply_chat_template(chats)
+        if len(source) >= max_seq_length:
+            continue
+        results.append([source, len(source), item["label"]])
+    return results
+
+
 class JSONRLHFDataset(torch.utils.data.Dataset):
     """
-    Experimental: This dataset is aimed for SFT of arbitrary models with a default chat_template, 
+    Experimental: This dataset is aimed for SFT of arbitrary models with a default chat_template,
     but not tested on all cases.
 
     A class for processing a conversation dataset
@@ -42,57 +64,73 @@ class JSONRLHFDataset(torch.utils.data.Dataset):
         self.IGNORE_INDEX = self.tokenizer.pad_token_id
         self.eos_token_id = self.tokenizer.eos_token_id
         self.is_pad_token_eos_token = self.tokenizer.pad_token_id == self.eos_token_id
-        self.max_seq_length = max_padding_length 
+        self.max_seq_length = max_padding_length
 
-        # list_data_dict = load_dataset(
-        #     'json',
-        #     data_files=path[0],
-        #     split=split,
-        # )
+        cache_path = self._get_cache_path(path[0], max_padding_length)
+        if cache_path and os.path.exists(cache_path):
+            print(f'  >> loading cached dataset from {cache_path}')
+            with open(cache_path, 'rb') as f:
+                self.samples = pickle.load(f)
+            print(f'  >> total number of samples: {len(self.samples)}')
+            return
 
-        # train_dataset = list_data_dict.map(
-        #     self.preprocess,
-        #     batched=True,
-        #     batch_size=3000,
-        #     num_proc=2,
-        #     remove_columns=list_data_dict.column_names,
-        #     load_from_cache_file=True,
-        #     # desc="Running Encoding"
-        # )
-        input_ids = []
-        lengths = []
-        ground_truths = []
         jdict = self.jload(path[0])
-        for i in tqdm(range(len(jdict))):
-            prompt = jdict[i]["prompt"]
-            
-            # all_ground_truths = jdict[i]["label"]
-            chats = [
-            # {"role": "system", "content": "Your are a helpful assistant."},
-            {"role": "user", "content": prompt}
-            ]
-            # for i,chat in enumerate(chats):
-            source = self.tokenizer.apply_chat_template(
-            chats,
-            # tokenize=True,
-            # add_generation_prompt=True
+        args = get_args()
+        tokenizer_path = getattr(args, 'load', None)
+
+        num_workers = min(16, max(1, os.cpu_count() // 2))
+        if tokenizer_path and len(jdict) > 1000 and num_workers > 1:
+            self.samples = self._parallel_tokenize(
+                jdict, tokenizer_path, max_padding_length, num_workers
             )
+        else:
+            self.samples = self._serial_tokenize(jdict)
+
+        if cache_path:
+            os.makedirs(os.path.dirname(cache_path), exist_ok=True)
+            with open(cache_path, 'wb') as f:
+                pickle.dump(self.samples, f, protocol=pickle.HIGHEST_PROTOCOL)
+            print(f'  >> cached dataset to {cache_path}')
+
+        print(f'  >> total number of samples: {len(self.samples)}')
+
+    def _get_cache_path(self, data_path, max_padding_length):
+        """Generate a deterministic cache path based on data file and config."""
+        try:
+            file_stat = os.stat(data_path)
+            cache_key = f"{data_path}_{file_stat.st_size}_{file_stat.st_mtime}_{max_padding_length}"
+            cache_hash = hashlib.md5(cache_key.encode()).hexdigest()
+            cache_dir = os.path.join(os.path.dirname(data_path), '.cache')
+            return os.path.join(cache_dir, f"rlhf_{cache_hash}.pkl")
+        except Exception:
+            return None
+
+    def _serial_tokenize(self, jdict):
+        """Original serial tokenization path."""
+        samples = []
+        for item in tqdm(jdict, desc="Tokenizing"):
+            prompt = item["prompt"]
+            chats = [{"role": "user", "content": prompt}]
+            source = self.tokenizer.apply_chat_template(chats)
             if len(source) >= self.max_seq_length:
-                print(len(source))
                 continue
-            input_ids.append(source)
-            lengths.append(len(source))
-            ground_truths.append(jdict[i]["label"])
+            samples.append([source, len(source), item["label"]])
+        return samples
 
-        self.input_ids = input_ids
-        self.lengths = lengths
-        self.ground_truths = ground_truths
-        self.samples = []
+    def _parallel_tokenize(self, jdict, tokenizer_path, max_padding_length, num_workers):
+        """Parallel tokenization using multiprocessing."""
+        chunk_size = max(1, len(jdict) // num_workers)
+        chunks = [jdict[i:i + chunk_size] for i in range(0, len(jdict), chunk_size)]
 
-        for inputs, lengths, ground_truths in tqdm(zip(self.input_ids, self.lengths, self.ground_truths)):
-            self.samples.append([inputs, lengths, ground_truths])
-
-        print('  >> total number of samples: {}'.format(len(self.samples)))
+        samples = []
+        with ProcessPoolExecutor(max_workers=num_workers) as executor:
+            futures = [
+                executor.submit(_tokenize_chunk, chunk, tokenizer_path, max_padding_length)
+                for chunk in chunks
+            ]
+            for future in tqdm(as_completed(futures), total=len(futures), desc="Parallel tokenizing"):
+                samples.extend(future.result())
+        return samples
 
     def _make_r_io_base(self, f, mode: str):
         if not isinstance(f, io.IOBase):
@@ -100,16 +138,15 @@ class JSONRLHFDataset(torch.utils.data.Dataset):
         return f
 
     def jload(self, f, mode='r'):
-        """
-        Load a .json file into a dictionary.
-        Args:
-            f: The file object or string representing the file path.
-            mode: The mode in which to open the file (e.g., 'r', 'w', 'a').
-        Returns:
-            A dictionary containing the contents of the JSON file.
-        """
+        """Load a .jsonl file into a list of dicts."""
         f = self._make_r_io_base(f, mode)
-        jdict = [json.loads(x) for x in f.readlines()][:100000]
+        jdict = []
+        for line in f:
+            line = line.strip()
+            if line:
+                jdict.append(json.loads(line))
+                if len(jdict) >= 100000:
+                    break
         f.close()
         return jdict
 
@@ -130,9 +167,6 @@ class JSONRLHFDataset(torch.utils.data.Dataset):
         Returns:
             dict: a dictionary containing the input_ids and labels for the examples
         """
-
-
-        
         input_ids = []
         lengths = []
         ground_truths = []
@@ -143,8 +177,6 @@ class JSONRLHFDataset(torch.utils.data.Dataset):
         for i,chat in enumerate(chats):
             source = self.tokenizer.apply_chat_template(
             chat,
-            # tokenize=True,
-            # add_generation_prompt=True
             )
             if len(source) >= self.max_seq_length:
                 print(len(source))
@@ -164,7 +196,7 @@ class JSONRLHFDataset(torch.utils.data.Dataset):
             "text": input_id,
             "length": input_id.shape[0],
             "ground_truth": ground_truth,
-            "loss_multiplier": True,        
+            "loss_multiplier": True,
         }
 
         return train_sample

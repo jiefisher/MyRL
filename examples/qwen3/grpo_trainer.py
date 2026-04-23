@@ -145,7 +145,11 @@ class Trainer:
                           wrap_with_ddp=False)
         
         if args.load is not None:
+            ref_load_path = getattr(args, 'ref_load', None) or args.load
+            original_load = args.load
+            args.load = ref_load_path
             load_checkpoint(self.ref_model, None, None)
+            args.load = original_load
             
         for model_chunk in self.ref_model:
             model_chunk.eval()
@@ -194,6 +198,50 @@ class Trainer:
         print_rank_0("data get")
         self.step = 0
         print_rank_0("init finfish")
+
+        # Agent multi-turn initialization
+        if getattr(args, 'agent_multi_turn', False):
+            from megatron_patch.agent import (
+                ToolRegistry, ToolCallParser, ToolFormatter,
+                SandboxPool, SandboxConfig, MultiTurnRolloutOrchestrator,
+                AgentRewardComputer, BioToolExecutor, register_bio_tools,
+            )
+            self.tool_registry = ToolRegistry()
+            self.tool_registry.register_builtin_tools()
+            register_bio_tools(self.tool_registry)
+            self.tool_parser = ToolCallParser(format=args.agent_tool_format)
+            self.tool_formatter = ToolFormatter(self.tokenizer, format=args.agent_tool_format)
+
+            if mpu.is_pipeline_last_stage(ignore_virtual=True):
+                self.sandbox_pool = SandboxPool(SandboxConfig(
+                    pool_size=args.sandbox_pool_size,
+                    max_memory_mb=args.sandbox_max_memory_mb,
+                    max_wall_time_sec=args.sandbox_timeout,
+                ))
+                self.bio_tool_executor = BioToolExecutor()
+            else:
+                self.sandbox_pool = None
+                self.bio_tool_executor = None
+
+            self.multi_turn_orchestrator = MultiTurnRolloutOrchestrator(
+                inference_engine=self.inference_engine,
+                sampling_params=self.sampling_params,
+                tokenizer=self.tokenizer,
+                tool_registry=self.tool_registry,
+                tool_parser=self.tool_parser,
+                tool_formatter=self.tool_formatter,
+                sandbox_pool=self.sandbox_pool,
+                max_turns=args.agent_max_turns,
+                max_total_tokens=args.agent_max_total_tokens,
+                bio_tool_executor=self.bio_tool_executor,
+            )
+            self.agent_reward = AgentRewardComputer(
+                final_reward_weight=args.final_reward_weight,
+                process_reward_weight=args.process_reward_weight,
+                tool_success_reward=args.tool_success_reward,
+                tool_failure_penalty=args.tool_failure_penalty,
+            )
+            print_rank_0("agent multi-turn initialized")
 
     def get_train_valid_test_num_samples(self):
         """Train/valid/test num samples."""
@@ -401,7 +449,7 @@ class Trainer:
 
         return model
 
-    # @torch.no_grad()
+    @torch.no_grad()
     def convert(self):
         # no_grad = torch.no_grad()
         # no_grad.__enter__()
@@ -472,6 +520,7 @@ class Trainer:
 
     def get_actor_forward_output_and_loss_func(self):
         def fwd_output_and_loss_func(data_iterator, model):
+            args = get_args()
             batch = next(data_iterator)
             required_keys = set()
             if mpu.get_pipeline_model_parallel_world_size() == 1:
@@ -484,6 +533,9 @@ class Trainer:
     
                 if mpu.is_pipeline_last_stage():
                     required_keys.update(("response_tokens", "advantages", "mask", "prev_logprobs", "reference_policy_logprobs", "is_end"))
+                    # Agent multi-turn keys
+                    if getattr(args, 'agent_multi_turn', False):
+                        required_keys.update(("agent_loss_mask", "process_rewards"))
     
             batch = {key: val.cuda(non_blocking=True) if key in required_keys else None for key, val in batch.items()}
     
@@ -494,12 +546,31 @@ class Trainer:
             def loss_func(parallel_logits):
                 args = get_args()
                 mask = batch["mask"]
-                local_valid_toks = batch["local_valid_toks"]
+                local_num_valid_responses = batch["local_num_valid_responses"]
                 prev_logprobs = batch["prev_logprobs"]
                 advantages = batch["advantages"]
                 tokens = batch["response_tokens"]
                 reference_policy_logprobs = batch["reference_policy_logprobs"]
                 generation_logprobs = batch["generation_logprobs"]
+
+                # Agent multi-turn: override mask with agent_loss_mask
+                if getattr(args, 'agent_multi_turn', False):
+                    agent_loss_mask = batch.get("agent_loss_mask")
+                    if agent_loss_mask is not None:
+                        # Trim to match sequence dimension
+                        if agent_loss_mask.size(-1) != mask.size(-1):
+                            agent_loss_mask = agent_loss_mask[..., :mask.size(-1)]
+                        mask = agent_loss_mask
+
+                    # Incorporate process rewards into advantages
+                    process_rewards = batch.get("process_rewards")
+                    if process_rewards is not None:
+                        if process_rewards.size(-1) != advantages.size(-1):
+                            # process_rewards is per-token, advantages is per-sample
+                            # Average process rewards over valid tokens for each sample
+                            pr_masked = process_rewards[..., :mask.size(-1)] * mask
+                            pr_per_sample = pr_masked.sum(dim=-1, keepdim=True) / (mask.sum(dim=-1, keepdim=True) + 1e-8)
+                            advantages = advantages + args.process_reward_weight * pr_per_sample
                 
                 # generation_logprobs = torch.zeros_like(
                 #     reference_policy_logprobs, dtype=torch.float32
@@ -508,6 +579,8 @@ class Trainer:
                 curr_logprobs = from_parallel_logits_to_logprobs(
                     vocab_parallel_logits=parallel_logits, target=tokens, higher_stability=True
                 )
+                # Ensure prompt/padding positions have safe importance weights (=1.0)
+                generation_logprobs = torch.where(mask.bool(), generation_logprobs, prev_logprobs)
                 # Token-level correction
                 actor_importance_weights_expanded = torch.exp(
                     prev_logprobs - generation_logprobs
@@ -531,12 +604,15 @@ class Trainer:
                         logprobs_policy=curr_logprobs,
                         logprobs_reference=reference_policy_logprobs,
                     )
-                )            
-                kl = masked_mean(
-                    kl, 
-                    mask,
-                    global_normalization_factor=local_valid_toks
                 )
+                # GRPO two-level normalization:
+                # Inner: per-response token average (1/|o_i|)
+                # Outer: per-group response average (1/G)
+                per_response_len = mask.sum(dim=-1).clamp(min=1)  # (B,)
+
+                kl_per_response = (kl * mask).sum(dim=-1) / per_response_len  # (B,)
+                kl = kl_per_response.sum() / (local_num_valid_responses + 1e-8)
+
                 ratios = (curr_logprobs - prev_logprobs).exp()
                 ratio_clip_min, ratio_clip_max = 0.2, 0.28
                 ratios_clamped = ratios.clamp(
@@ -545,11 +621,9 @@ class Trainer:
                 loss1 = -advantages * ratios
                 loss2 = -advantages * ratios_clamped
                 clip_loss = torch.max(loss1, loss2)
-                actor_loss = masked_mean(
-                    importance_weights_to_use * clip_loss,
-                    mask,
-                    global_normalization_factor=local_valid_toks
-                )
+
+                per_response_clip_loss = (importance_weights_to_use * clip_loss * mask).sum(dim=-1) / per_response_len  # (B,)
+                actor_loss = per_response_clip_loss.sum() / (local_num_valid_responses + 1e-8)
                 
                 loss = actor_loss + kl
                 reduced_actor_loss = average_losses_across_data_parallel_group([loss])
@@ -667,7 +741,7 @@ class Trainer:
 
         return metrics
 
-    # @torch.no_grad()
+    @torch.no_grad()
     def evaluate(self):
         args = get_args()
         step = 0
@@ -705,23 +779,18 @@ class Trainer:
             
             results.extend(outputs)
             
-        cache_li = []
+        result_idx = 0
         for rollout_batch in rollout_batches:
-            for i, output in enumerate(results):
-                if i not in cache_li:
-                    if "ground_truth" in rollout_batch:
-                        if [output.prompt_token_ids] == rollout_batch["prompt_tokens"]:
-    
-                            rollout_batch["response_tokens"] = torch.LongTensor([output.prompt_token_ids + output.outputs[0].token_ids]).cpu()
-                            rollout_batch["response_lengths"] = torch.LongTensor([len(output.prompt_token_ids) + len(output.outputs[0].token_ids)]).cpu()
-                            
-                            
-                            reward = compute_score(output.outputs[0].text, str(rollout_batch["ground_truth"][0]))
-                            is_end = torch.LongTensor([1 if output.outputs[0].token_ids[-1]==self.tokenizer.eos_token_id else 0]).cpu()
-                            rollout_batch["is_end"] = is_end
-                            rollout_batch["rewards"] = torch.FloatTensor([reward]).cpu()
-                            rollout_batch.pop("ground_truth")
-                            cache_li.append(i)
+            num_prompts = len(rollout_batch["prompt_tokens"])
+            output = results[result_idx]
+            rollout_batch["response_tokens"] = torch.LongTensor([output.prompt_token_ids + output.outputs[0].token_ids]).cpu()
+            rollout_batch["response_lengths"] = torch.LongTensor([len(output.prompt_token_ids) + len(output.outputs[0].token_ids)]).cpu()
+            reward = compute_score(output.outputs[0].text, str(rollout_batch["ground_truth"][0]))
+            is_end = torch.LongTensor([1 if output.outputs[0].token_ids[-1]==self.tokenizer.eos_token_id else 0]).cpu()
+            rollout_batch["is_end"] = is_end
+            rollout_batch["rewards"] = torch.FloatTensor([reward]).cpu()
+            rollout_batch.pop("ground_truth")
+            result_idx += num_prompts
 
         self.inference_engine.sleep(2)
         torch._C._cuda_clearCublasWorkspaces()
@@ -774,6 +843,208 @@ class Trainer:
 
     def preparing_training_data(self):
         args = get_args()
+        if getattr(args, 'agent_multi_turn', False):
+            return self._preparing_training_data_multi_turn()
+        return self._preparing_training_data_single_turn()
+
+    def _preparing_training_data_multi_turn(self):
+        """Multi-turn agent rollout path."""
+        args = get_args()
+
+        sampler_iter = iter(cyclic_iter(self.train_dataloader.batch_sampler))
+        rollout_num_microbatches = compute_num_rollout_microbatches(args, self.train_dataloader)
+        collate_fn = torch.utils.data.dataloader.default_collate
+        batch_iterator = DefaultBatchIterator(
+            sampler_iter, rollout_num_microbatches,
+            self.train_dataloader.dataset, collate_fn,
+        )
+
+        # Collect prompts and ground truths
+        all_prompt_tokens = []
+        all_ground_truths = []
+        for batch in batch_iterator:
+            for _ in range(args.vllm_num_rollout_samples):
+                token_ids = batch["text"].tolist()
+                for tid in token_ids:
+                    all_prompt_tokens.append(tid)
+                    # ground_truth is a list from collate
+                gt_list = batch["ground_truth"]
+                for gt in (gt_list if isinstance(gt_list, list) else [gt_list]):
+                    all_ground_truths.append(str(gt))
+
+        # Run multi-turn rollout
+        trajectories = self.multi_turn_orchestrator.rollout_batch(
+            all_prompt_tokens, all_ground_truths,
+        )
+
+        # Compute rewards and build rollout batches
+        rollout_batches = []
+        for sample_idx, traj in enumerate(trajectories):
+            # Determine reward source: bio env or standard rpf
+            final_reward = 0.0
+            has_bio_finalize = any(
+                t.tool_call is not None and t.tool_call.tool_name == "workflow_finalize"
+                for t in traj.turns
+            )
+            if has_bio_finalize and self.bio_tool_executor is not None:
+                # Bio workflow reward from 6-layer verification
+                env = self.bio_tool_executor.get_or_create_env(sample_idx)
+                if env._finalized:
+                    # Re-run finalize to get reward
+                    env._finalized = False
+                    _, bio_reward, _ = env.finalize()
+                    final_reward = bio_reward
+                else:
+                    final_reward = 0.0
+            else:
+                # Standard reward (math/code tasks)
+                last_text = traj.last_generated_text
+                final_reward = compute_score(last_text, traj.ground_truth)
+
+            # Agent reward (final + process)
+            reward_info = self.agent_reward.compute_trajectory_reward(traj, final_reward)
+
+            # Convert trajectory to training tensors
+            tensors = traj.to_training_tensors(
+                max_seq_length=args.max_padding_length,
+                pad_token_id=self.tokenizer.eos_token_id,
+            )
+
+            # Assign process rewards to tokens
+            self.agent_reward.assign_process_rewards_to_tokens(
+                traj,
+                reward_info["per_turn_rewards"],
+                tensors["process_rewards"],
+                tensors["prompt_length"],
+            )
+
+            is_end = 1 if traj.is_complete else 0
+            rollout_batch = {
+                "prompt_tokens": torch.LongTensor(traj.original_prompt_tokens).unsqueeze(0),
+                "prompt_lengths": torch.LongTensor([tensors["prompt_length"]]),
+                "response_tokens": tensors["response_tokens"].unsqueeze(0),
+                "response_lengths": torch.LongTensor([tensors["response_length"]]),
+                "rewards": torch.FloatTensor([reward_info["total_reward"]]),
+                "is_end": torch.LongTensor([is_end]),
+                "generation_logprobs": tensors["generation_logprobs"].unsqueeze(0),
+                "agent_loss_mask": tensors["agent_loss_mask"].unsqueeze(0),
+                "process_rewards": tensors["process_rewards"].unsqueeze(0),
+            }
+
+            # Broadcast across pipeline stages
+            rollout_batch["prompt_tokens"] = batch_pad_to_fixed_len(
+                rollout_batch["prompt_tokens"], args.max_padding_length, self.tokenizer.eos_token_id
+            )
+            for key in rollout_batch:
+                rollout_batch[key] = broadcast_tensor_within_pp(rollout_batch[key], from_last=False)
+
+            max_length = rollout_batch["response_lengths"].max().item()
+            rollout_batch["response_tokens"] = rollout_batch["response_tokens"][..., :max_length].contiguous()
+            rollout_batch["response_tokens"] = broadcast_2d_tensor_within_mp(
+                rollout_batch["response_tokens"], dtype=rollout_batch["response_tokens"].dtype
+            )
+            rollout_batch["generation_logprobs"] = broadcast_2d_tensor_within_mp(
+                rollout_batch["generation_logprobs"], dtype=rollout_batch["generation_logprobs"].dtype
+            )
+            rollout_batch["agent_loss_mask"] = broadcast_2d_tensor_within_mp(
+                rollout_batch["agent_loss_mask"], dtype=rollout_batch["agent_loss_mask"].dtype
+            )
+            rollout_batch["process_rewards"] = broadcast_2d_tensor_within_mp(
+                rollout_batch["process_rewards"], dtype=rollout_batch["process_rewards"].dtype
+            )
+            rollout_batches.append(rollout_batch)
+
+        self.inference_engine.sleep(2)
+        torch._C._cuda_clearCublasWorkspaces()
+        torch._dynamo.reset()
+        gc.collect()
+        torch.cuda.empty_cache()
+
+        unbalanced_local_batch = ReinforceRolloutBatch.from_rollout_batches(
+            rollout_batches,
+            eos_id=self.tokenizer.eos_token_id,
+            rollout_batch_seq_length=args.max_padding_length,
+        )
+        global_rollout_batch = unbalanced_local_batch.gather_and_balance_globally()
+        balanced_local_batch = global_rollout_batch.chunk(
+            rank=mpu.get_data_parallel_rank(),
+            split_size=mpu.get_data_parallel_world_size(),
+            seed=self.step,
+        )
+        self.step += 1
+
+        batched_response_tokens = balanced_local_batch["response_tokens"]
+        self._memory_manager.onload_weights()
+        rollout_logprobs = self.get_inference_log_probs(
+            self.model, batched_response_tokens, self.tokenizer.eos_token_id, 8
+        )
+        balanced_local_batch["prev_logprobs"] = rollout_logprobs
+        self._memory_manager.offload_weights()
+
+        self.ref_memory_manager.onload_weights()
+        rollout_ref_logprobs = self.get_inference_log_probs(
+            self.ref_model, batched_response_tokens, self.tokenizer.eos_token_id, 8
+        )
+        balanced_local_batch["ref_logprobs"] = rollout_ref_logprobs
+        self.ref_memory_manager.offload_weights()
+
+        reinforce_rollout_data = {}
+        prompt_lengths = balanced_local_batch["prompt_lengths"]
+        response_lengths = balanced_local_batch["response_lengths"]
+        prompt_tokens = balanced_local_batch["prompt_tokens"]
+        response_tokens = balanced_local_batch["response_tokens"]
+        rewards = balanced_local_batch["rewards"]
+        logprobs = balanced_local_batch["prev_logprobs"]
+        sample_mask = balanced_local_batch["is_end"]
+
+        # Use agent_loss_mask instead of create_mask for multi-turn
+        if "agent_loss_mask" in balanced_local_batch and balanced_local_batch["agent_loss_mask"] is not None:
+            token_mask = balanced_local_batch["agent_loss_mask"]
+            # Ensure shape matches logprobs
+            if token_mask.size(-1) != logprobs.size(-1):
+                token_mask = token_mask[..., :logprobs.size(-1)]
+        else:
+            token_mask = create_mask(values=logprobs, prompt_lengths=prompt_lengths, response_lengths=response_lengths)
+
+        mask = token_mask * sample_mask.unsqueeze(-1)
+        local_num_valid_responses = sample_mask.sum()
+        local_num_valid_responses = broadcast_tensor_within_pp(local_num_valid_responses)
+
+        baseline, std = calculate_baseline_and_std_per_prompt(
+            prompt_tokens, rewards,
+            torch.ones_like(rewards),
+            leave_one_out_baseline=True,
+        )
+        advantages = (rewards - baseline).unsqueeze(-1)
+        zero_std_mask = std > 0
+        advantages[zero_std_mask] = (
+            advantages[zero_std_mask] / std.unsqueeze(-1)[zero_std_mask]
+        )
+
+        reinforce_rollout_data["mask"] = mask
+        reinforce_rollout_data["prev_logprobs"] = balanced_local_batch["prev_logprobs"]
+        reinforce_rollout_data["advantages"] = advantages
+        reinforce_rollout_data["response_tokens"] = response_tokens
+        reinforce_rollout_data["local_num_valid_responses"] = local_num_valid_responses
+        reinforce_rollout_data["reference_policy_logprobs"] = balanced_local_batch["ref_logprobs"]
+        reinforce_rollout_data["generation_logprobs"] = balanced_local_batch["generation_logprobs"]
+
+        # Pass agent-specific tensors
+        if "agent_loss_mask" in balanced_local_batch:
+            reinforce_rollout_data["agent_loss_mask"] = balanced_local_batch["agent_loss_mask"]
+        if "process_rewards" in balanced_local_batch:
+            reinforce_rollout_data["process_rewards"] = balanced_local_batch["process_rewards"]
+
+        rollout_size = reinforce_rollout_data["response_tokens"].size(0)
+        dp_size = mpu.get_data_parallel_world_size()
+        num_to_load_on_each_dp = divide(args.global_batch_size, dp_size)
+        rollout_dataloader_iter = get_iterator_k_split(
+            reinforce_rollout_data, divide(rollout_size, num_to_load_on_each_dp)
+        )
+        return rollout_dataloader_iter
+
+    def _preparing_training_data_single_turn(self):
+        args = get_args()
         sampler_iter = iter(cyclic_iter(self.train_dataloader.batch_sampler))
         rollout_num_microbatches = compute_num_rollout_microbatches(args, self.train_dataloader)
         collate_fn = torch.utils.data.dataloader.default_collate
@@ -814,9 +1085,10 @@ class Trainer:
                                 output.outputs[0].token_ids,
                                 output.outputs[0].logprobs
                             ):
-                                    if logprob_obj:
-                                        for token, logprob in logprob_obj.items():
-                                            logprobs_list.append(logprob.logprob)
+                                    if logprob_obj and token_id in logprob_obj:
+                                        logprobs_list.append(logprob_obj[token_id].logprob)
+                                    else:
+                                        logprobs_list.append(0.0)
                             rollout_batch["generation_logprobs"] =  torch.FloatTensor([logprobs_list]).cpu()
                             rollout_batch["response_tokens"] = torch.LongTensor([output.prompt_token_ids + output.outputs[0].token_ids]).cpu()
                             rollout_batch["response_lengths"] = torch.LongTensor([len(output.prompt_token_ids) + len(output.outputs[0].token_ids)]).cpu()
@@ -868,10 +1140,8 @@ class Trainer:
         self.step += 1
         batched_response_tokens = balanced_local_batch["response_tokens"]
         self._memory_manager.onload_weights()
-        self._memory_manager.onload_main_weights()
         rollout_logprobs = self.get_inference_log_probs(self.model,batched_response_tokens,self.tokenizer.eos_token_id,8)
         balanced_local_batch["prev_logprobs"] = rollout_logprobs
-        self._memory_manager.offload_main_weights()
         self._memory_manager.offload_weights()
         self.ref_memory_manager.onload_weights()
         rollout_ref_logprobs = self.get_inference_log_probs(self.ref_model,batched_response_tokens,self.tokenizer.eos_token_id,8)
@@ -889,22 +1159,18 @@ class Trainer:
 
         token_mask = create_mask(values=logprobs, prompt_lengths=prompt_lengths, response_lengths=response_lengths)
         mask = token_mask * sample_mask.unsqueeze(-1)
-        # local_valid_seqs = torch.sum(sample_mask.unsqueeze(-1))
-        local_valid_toks = torch.sum(
-                        token_mask[:, 1:]
-                        * sample_mask.unsqueeze(-1)
-                    ).unsqueeze(-1).repeat(token_mask.shape[0])
-        local_valid_toks = broadcast_tensor_within_pp(local_valid_toks)
+        local_num_valid_responses = sample_mask.sum()
+        local_num_valid_responses = broadcast_tensor_within_pp(local_num_valid_responses)
 
 
         baseline, std = calculate_baseline_and_std_per_prompt(
                     prompt_tokens,
                     rewards,
                     torch.ones_like(rewards),
-                    leave_one_out_baseline=False,
+                    leave_one_out_baseline=True,
         )
         advantages = (rewards - baseline).unsqueeze(-1)
-        
+
         zero_std_mask = std > 0
         advantages[zero_std_mask] = (
             advantages[zero_std_mask] / std.unsqueeze(-1)[zero_std_mask]
@@ -914,8 +1180,7 @@ class Trainer:
         reinforce_rollout_data["prev_logprobs"] = balanced_local_batch["prev_logprobs"]
         reinforce_rollout_data["advantages"] = advantages
         reinforce_rollout_data["response_tokens"] = response_tokens
-        # reinforce_rollout_data["local_valid_seqs"] = local_valid_seqs
-        reinforce_rollout_data["local_valid_toks"] = local_valid_toks
+        reinforce_rollout_data["local_num_valid_responses"] = local_num_valid_responses
         reinforce_rollout_data["reference_policy_logprobs"] = balanced_local_batch["ref_logprobs"]
         reinforce_rollout_data["generation_logprobs"] = balanced_local_batch["generation_logprobs"]
 
@@ -931,66 +1196,60 @@ class Trainer:
     
     def train(self):
         args = get_args()
-        iteration = 0
-        
+
         set_jit_fusion_options()
         for roll_iter in range(args.train_iters):
-            
+
             if args.eval_interval and self.step % args.eval_interval == 0 and \
                 args.do_valid:
 
                 print_rank_0("==================start valid============")
                 self.evaluate()
                 print_rank_0("==================end valid============")
-            
-            
+
+
             self.inference_engine.wake_up()
             self.convert()
             rollout_dataloader_iter = self.preparing_training_data()
             self.inference_engine.sleep(2)
             self._memory_manager.onloads()
-        
+
             for batch in rollout_dataloader_iter:
                 sequence_length = batch["response_tokens"].size(1)
                 eos_id = self.tokenizer.eos_token_id
                 attention_mask, _, position_ids = get_ltor_masks_and_position_ids(batch["response_tokens"], eos_id, False, False, False)
                 batch["attention_mask"] = attention_mask.expand(batch["response_tokens"].size(0), -1, -1, -1)
                 batch["position_ids"] = position_ids.expand(batch["response_tokens"].size(0), -1)
-                
+
                 data_iter = get_iterator_k_split(batch, get_num_microbatches())
                 num_microbatches = get_num_microbatches()
-                
+
                 if args.profile and torch.distributed.get_rank() in args.profile_ranks:
                     if args.use_pytorch_profiler:
                         prof.step()
-                    elif iteration == args.profile_step_start:
+                    elif self.step == args.profile_step_start:
                         torch.cuda.cudart().cudaProfilerStart()
                         torch.autograd.profiler.emit_nvtx(record_shapes=True).__enter__()
-        
+
                 ft_integration.on_checkpointing_start()
                 maybe_finalize_async_save(blocking=False)
                 ft_integration.on_checkpointing_end(is_async_finalization=True)
-        
+
                 # Update number of microbatches first without consistency check to decide if a
                 # checkpoint should be saved. If the number of microbatches is different
                 # from the previous iteration, save a checkpoint. Then run consistency check
                 # to make sure training configuration is still valid.
                 update_num_microbatches(args.consumed_train_samples, consistency_check=False, verbose=True)
-                if get_num_microbatches() != num_microbatches and iteration != 0:
+                if get_num_microbatches() != num_microbatches and self.step != 0:
                     assert get_num_microbatches() > num_microbatches, \
                         (f"Number of microbatches should be increasing due to batch size rampup; "
                          f"instead going from {num_microbatches} to {get_num_microbatches()}")
 
                 # Run training step.
-                args.curr_iteration = iteration
+                args.curr_iteration = self.step
                 ft_integration.on_training_step_start()
                 loss_reduced, skipped_iter, grad_norm, num_zeros_in_grad = self.train_step(data_iter)
                 ft_integration.on_training_step_end()
-                iteration += 1
-                if args.save and self.step != 0 and self.step % args.save_interval == 0:
-                    print_rank_0("==================start saving checkpoint============")
-                    self.save(self.step)
-                    print_rank_0("==================end saving checkpoint============")
                 batch_size = mpu.get_data_parallel_world_size() * \
                      args.micro_batch_size * \
                      get_num_microbatches()
@@ -1001,7 +1260,7 @@ class Trainer:
                 else:
                     loss_scale = 1.0
                 params_norm = None
-        
+
                 if args.log_params_norm:
                     params_norm = calc_params_l2_norm(self.model)
                 learning_rate = None
@@ -1011,6 +1270,12 @@ class Trainer:
                         decoupled_learning_rate = param_group['lr']
                     else:
                         learning_rate = param_group['lr']
+                print_rank_0(f"step: {self.step} | loss: {loss_reduced} | grad_norm: {grad_norm} | lr: {learning_rate} | loss_scale: {loss_scale} | skipped: {skipped_iter}")
+
+            if args.save and self.step != 0 and self.step % args.save_interval == 0:
+                print_rank_0("==================start saving checkpoint============")
+                self.save(self.step)
+                print_rank_0("==================end saving checkpoint============")
             self._memory_manager.offloads()
 
 if __name__ == "__main__":
