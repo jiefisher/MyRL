@@ -22,6 +22,7 @@ class MultiTurnRolloutOrchestrator:
         max_turns: int = 5,
         max_total_tokens: int = 16384,
         bio_tool_executor=None,
+        vllm_batch_size: int = 1024,
     ):
         self.inference_engine = inference_engine
         self.sampling_params = sampling_params
@@ -33,6 +34,7 @@ class MultiTurnRolloutOrchestrator:
         self.max_turns = max_turns
         self.max_total_tokens = max_total_tokens
         self.bio_tool_executor = bio_tool_executor
+        self.vllm_batch_size = vllm_batch_size
 
     def _execute_tool(self, global_idx: int, parsed_call, turn: TurnRecord):
         """Execute a single tool call and populate turn with results."""
@@ -96,11 +98,15 @@ class MultiTurnRolloutOrchestrator:
 
             # 1. Batch vLLM generation for all active samples
             active_prompts = [current_tokens[i] for i in active_indices]
-            outputs = self.inference_engine.generate(
-                prompt_token_ids=active_prompts,
-                sampling_params=self.sampling_params,
-                use_tqdm=False,
-            )
+            outputs = []
+            for batch_start in range(0, len(active_prompts), self.vllm_batch_size):
+                batch_prompts = active_prompts[batch_start:batch_start + self.vllm_batch_size]
+                batch_outputs = self.inference_engine.generate(
+                    prompt_token_ids=batch_prompts,
+                    sampling_params=self.sampling_params,
+                    use_tqdm=False,
+                )
+                outputs.extend(batch_outputs)
 
             # 2. Parse each output
             needs_tool = []  # (global_idx, parsed_tool_call, turn)

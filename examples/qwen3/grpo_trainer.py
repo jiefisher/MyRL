@@ -234,6 +234,7 @@ class Trainer:
                 max_turns=args.agent_max_turns,
                 max_total_tokens=args.agent_max_total_tokens,
                 bio_tool_executor=self.bio_tool_executor,
+                vllm_batch_size=args.vllm_batch_size,
             )
             self.agent_reward = AgentRewardComputer(
                 final_reward_weight=args.final_reward_weight,
@@ -489,7 +490,12 @@ class Trainer:
     def get_inference_log_probs(self, model, response_tokens, eos_id, forward_micro_batch_size=None):
         args = get_args()
         if forward_micro_batch_size is None:
-            forward_micro_batch_size = args.micro_batch_size
+            if getattr(args, 'inference_micro_batch_size', None) is not None:
+                forward_micro_batch_size = args.inference_micro_batch_size
+            else:
+                forward_micro_batch_size = args.micro_batch_size * 2
+        mbs = response_tokens.size(0)
+        forward_micro_batch_size = min(forward_micro_batch_size, mbs)
             
         mbs, seq_length = response_tokens.size()
         num_microbatches = divide(mbs, forward_micro_batch_size)
@@ -976,14 +982,14 @@ class Trainer:
         batched_response_tokens = balanced_local_batch["response_tokens"]
         self._memory_manager.onload_weights()
         rollout_logprobs = self.get_inference_log_probs(
-            self.model, batched_response_tokens, self.tokenizer.eos_token_id, 8
+            self.model, batched_response_tokens, self.tokenizer.eos_token_id
         )
         balanced_local_batch["prev_logprobs"] = rollout_logprobs
         self._memory_manager.offload_weights()
 
         self.ref_memory_manager.onload_weights()
         rollout_ref_logprobs = self.get_inference_log_probs(
-            self.ref_model, batched_response_tokens, self.tokenizer.eos_token_id, 8
+            self.ref_model, batched_response_tokens, self.tokenizer.eos_token_id
         )
         balanced_local_batch["ref_logprobs"] = rollout_ref_logprobs
         self.ref_memory_manager.offload_weights()
@@ -1063,7 +1069,7 @@ class Trainer:
                 rollout_batches.append(rollout_batch)
                 for token_id in token_ids:
                     prompt.append(token_id)
-        vllm_batch_size = 1024
+        vllm_batch_size = args.vllm_batch_size
         iter_num = len(prompt)//vllm_batch_size if len(prompt)%vllm_batch_size==0 else len(prompt)//vllm_batch_size+1
 
         for i in range(iter_num):
@@ -1140,11 +1146,11 @@ class Trainer:
         self.step += 1
         batched_response_tokens = balanced_local_batch["response_tokens"]
         self._memory_manager.onload_weights()
-        rollout_logprobs = self.get_inference_log_probs(self.model,batched_response_tokens,self.tokenizer.eos_token_id,8)
+        rollout_logprobs = self.get_inference_log_probs(self.model,batched_response_tokens,self.tokenizer.eos_token_id)
         balanced_local_batch["prev_logprobs"] = rollout_logprobs
         self._memory_manager.offload_weights()
         self.ref_memory_manager.onload_weights()
-        rollout_ref_logprobs = self.get_inference_log_probs(self.ref_model,batched_response_tokens,self.tokenizer.eos_token_id,8)
+        rollout_ref_logprobs = self.get_inference_log_probs(self.ref_model,batched_response_tokens,self.tokenizer.eos_token_id)
         balanced_local_batch["ref_logprobs"] = rollout_ref_logprobs
         self.ref_memory_manager.offload_weights()
         reinforce_rollout_data = {}

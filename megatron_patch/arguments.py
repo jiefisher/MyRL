@@ -105,6 +105,14 @@ def get_patch_args(parser):
         help="rope-type for MLA attn"
     )
 
+    group.add_argument(
+        "--inference-micro-batch-size",
+        type=int,
+        default=None,
+        help="Micro batch size for inference forward passes (log_probs computation). "
+             "Defaults to 2x micro_batch_size since inference requires no activation memory.",
+    )
+
     group.add_argument("--n-head-kv", type=int, default=None, help="n-head-kv")
 
     group.add_argument(
@@ -614,6 +622,13 @@ def get_patch_args(parser):
         "--vllm-num-rollout-samples",
         type=int,
         help="rollout samples num of each prompt",
+    )
+
+    group.add_argument(
+        "--vllm-batch-size",
+        type=int,
+        default=1024,
+        help="Batch size for vLLM generate calls. Controls how many prompts are sent per iteration.",
     )
 
     group.add_argument(
